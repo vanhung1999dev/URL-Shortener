@@ -1,6 +1,7 @@
 package routes
 
 import (
+	"log"
 	"os"
 	"strconv"
 	"time"
@@ -58,11 +59,6 @@ func ShortenURL(ctx *fiber.Ctx) error {
 		return ctx.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid URL"})
 	}
 
-	// check for domain error
-	if !helpers.RemoveDomainError(body.URL) {
-		return ctx.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "Invald Domain"})
-	}
-
 	// enforce HTTPS, SSL
 	body.URL = helpers.EnforceHTTP(body.URL)
 
@@ -87,10 +83,10 @@ func ShortenURL(ctx *fiber.Ctx) error {
 		body.Expiry = 24
 	}
 
-	err = redisServer0.Set(database.Ctx, id, body.URL, body.Expiry*3600*time.Second).Err()
-
-	if err != redis.Nil {
-		return ctx.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Unable to connect to server"})
+	err = redisServer0.Set(database.Ctx, id, body.URL, time.Duration(body.Expiry)*time.Hour).Err()
+	if err != nil {
+		log.Printf("Redis SET error: %v", err)
+		return ctx.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to save short URL"})
 	}
 
 	res := response{

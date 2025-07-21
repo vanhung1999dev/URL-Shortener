@@ -7,7 +7,7 @@ import (
 )
 
 func ResolveURL(ctx *fiber.Ctx) error {
-	url := ctx.Params("url")
+	url := ctx.Params("longUrl")
 
 	redisServer0 := database.CreateClient(0)
 	defer redisServer0.Close()
@@ -15,9 +15,15 @@ func ResolveURL(ctx *fiber.Ctx) error {
 	value, err := redisServer0.Get(database.Ctx, url).Result()
 
 	if err == redis.Nil {
-		return ctx.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "short url not found in the database"})
-	} else if err != redis.Nil {
-		return ctx.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Cannot connect to database"})
+		// Key not found in Redis
+		return ctx.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"error": "Short URL not found in the database",
+		})
+	} else if err != nil {
+		// Any other actual Redis error
+		return ctx.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Redis error: " + err.Error(),
+		})
 	}
 
 	redisServer1 := database.CreateClient(1)
