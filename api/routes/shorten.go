@@ -1,111 +1,86 @@
 package routes
 
 import (
-	"log"
 	"os"
 	"strconv"
 	"time"
 
 	"github.com/asaskevich/govalidator"
-	"github.com/go-redis/redis/v8"
 	"github.com/gofiber/fiber/v2"
-	"github.com/google/uuid"
+	"github.com/sony/sonyflake"
 	"github.com/vanhung1999dev/url-shortener/database"
 	"github.com/vanhung1999dev/url-shortener/helpers"
 )
 
 type request struct {
-	URL         string        `json:"url"`
-	CustomShort string        `json:"short"`
-	Expiry      time.Duration `json:"expiry"`
+	LongURL string `json:"long_url"`
 }
 
 type response struct {
-	URL             string        `json:"url"`
-	CustomShort     string        `json:"short"`
-	Expiry          time.Duration `json:"expiry"`
-	XRateRemaining  int           `json:"reate_limit"`
-	XRateLimitReset time.Duration `json:"rate_limit_reset"`
+	ShortURL string `json:"short_url"`
 }
 
 func ShortenURL(ctx *fiber.Ctx) error {
-	body := new(request)
-
+	var body request
 	if err := ctx.BodyParser(&body); err != nil {
-		return ctx.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Cannot parse JSON"})
+		return ctx.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid request body"})
 	}
 
-	// implement rate limiting
-	redisServer1 := database.CreateClient(1)
-	defer redisServer1.Close()
-
-	val, err := redisServer1.Get(database.Ctx, ctx.IP()).Result()
-
-	if err == redis.Nil {
-		_ = redisServer1.Set(database.Ctx, ctx.IP(), os.Getenv("API_QUOTA"), 30*60*time.Second).Err()
-	} else {
-		valInt, _ := strconv.Atoi(val)
-
-		if valInt <= 0 {
-			limit, _ := redisServer1.TTL(database.Ctx, ctx.IP()).Result()
-
-			return ctx.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "Rate limit exceeded", "rate_limit_reset": limit / time.Nanosecond / time.Minute})
-		}
-
-	}
-
-	// check if the input if an actual URL
-	if !govalidator.IsURL(body.URL) {
+	if !govalidator.IsURL(body.LongURL) {
 		return ctx.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid URL"})
 	}
 
-	// enforce HTTPS, SSL
-	body.URL = helpers.EnforceHTTP(body.URL)
+	body.LongURL = helpers.EnforceHTTP(body.LongURL)
 
-	var id string
+	// Rate limit per second
+	redisRate := database.CreateClient(1)
+	defer redisRate.Close()
 
-	if body.CustomShort == "" {
-		id = uuid.New().String()[:6]
-	} else {
-		id = body.CustomShort
+	rateKey := "rate:" + ctx.IP()
+	exists, _ := redisRate.Exists(database.Ctx, rateKey).Result()
+	if exists > 0 {
+		return ctx.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{"error": "Rate limit exceeded, try again in 1 second"})
+	}
+	redisRate.Set(database.Ctx, rateKey, "1", 1*time.Second)
+
+	// Check if long URL already exists
+	redisMain := database.CreateClient(0)
+	defer redisMain.Close()
+
+	existingShortKey := "url_map:" + body.LongURL
+	existingID, _ := redisMain.Get(database.Ctx, existingShortKey).Result()
+	if existingID != "" {
+		return ctx.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "URL already shortened"})
 	}
 
-	redisServer0 := database.CreateClient(0)
-	defer redisServer0.Close()
+	// Generate Snowflake ID
+	sf := sonyflake.NewSonyflake(sonyflake.Settings{
+		MachineID: func() (uint16, error) {
+			return 1, nil
+		},
+	})
 
-	value, _ := redisServer0.Get(database.Ctx, id).Result()
-
-	if value != "" {
-		return ctx.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "Url custom short is already use"})
+	if sf == nil {
+		return ctx.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to initialize ID generator"})
 	}
 
-	if body.Expiry == 0 {
-		body.Expiry = 24
-	}
-
-	err = redisServer0.Set(database.Ctx, id, body.URL, time.Duration(body.Expiry)*time.Hour).Err()
+	id, err := sf.NextID()
 	if err != nil {
-		log.Printf("Redis SET error: %v", err)
-		return ctx.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to save short URL"})
+		return ctx.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "ID generation error"})
 	}
 
-	res := response{
-		URL:             body.URL,
-		CustomShort:     "",
-		Expiry:          body.Expiry,
-		XRateRemaining:  10,
-		XRateLimitReset: 30,
+	shortID := strconv.FormatUint(id, 36) // base36 encoding
+
+	// Save shortID → longURL and longURL → shortID
+	if err := redisMain.Set(database.Ctx, shortID, body.LongURL, 24*time.Hour).Err(); err != nil {
+		return ctx.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to store URL"})
 	}
 
-	redisServer1.Decr(database.Ctx, ctx.IP())
+	// Map longURL → shortID to detect duplicates
+	_ = redisMain.Set(database.Ctx, existingShortKey, shortID, 24*time.Hour).Err()
 
-	val, _ = redisServer1.Get(database.Ctx, ctx.IP()).Result()
-	res.XRateRemaining, _ = strconv.Atoi(val)
-
-	ttl, _ := redisServer1.TTL(database.Ctx, ctx.IP()).Result()
-	res.XRateLimitReset = ttl / time.Nanosecond / time.Minute
-
-	res.CustomShort = os.Getenv("DOMAIN") + "/" + id
-
-	return ctx.Status(fiber.StatusOK).JSON(res)
+	// Return response
+	return ctx.Status(fiber.StatusOK).JSON(response{
+		ShortURL: os.Getenv("DOMAIN") + "/" + shortID,
+	})
 }
