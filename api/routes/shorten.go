@@ -55,9 +55,7 @@ func ShortenURL(ctx *fiber.Ctx) error {
 
 	// Generate Snowflake ID
 	sf := sonyflake.NewSonyflake(sonyflake.Settings{
-		MachineID: func() (uint16, error) {
-			return 1, nil
-		},
+		MachineID: helpers.InitMachineID,
 	})
 
 	if sf == nil {
